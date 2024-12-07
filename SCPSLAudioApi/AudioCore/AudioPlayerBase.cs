@@ -7,8 +7,10 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using AdminToys;
 using UnityEngine;
 using UnityEngine.Networking;
+using UnityEngine.Serialization;
 using VoiceChat;
 using VoiceChat.Codec;
 using VoiceChat.Networking;
@@ -16,22 +18,28 @@ using Random = UnityEngine.Random;
 
 namespace SCPSLAudioApi.AudioCore
 {
-    public class AudioPlayerBase : MonoBehaviour
+    public class AudioSpeakerBase : MonoBehaviour
     {
-        public static Dictionary<ReferenceHub, AudioPlayerBase> AudioPlayers = new Dictionary<ReferenceHub, AudioPlayerBase>();
+        public static byte Id = 0;
+
+        public static Dictionary<SpeakerToy, AudioSpeakerBase> AudioSpeakerToys { get; } = [];
 
         #region Internal
 
-        public const int HeadSamples = 1920;
-        public OpusEncoder Encoder { get; } = new OpusEncoder(VoiceChat.Codec.Enums.OpusApplicationType.Voip);
+        public const int HEAD_SAMPLES = 1920;
+        public OpusEncoder Encoder { get; } = new OpusEncoder(VoiceChat.Codec.Enums.OpusApplicationType.Audio);
         public PlaybackBuffer PlaybackBuffer { get; } = new PlaybackBuffer();
         public byte[] EncodedBuffer { get; } = new byte[512];
-        public bool stopTrack = false;
-        public bool ready = false;
+        [FormerlySerializedAs("stopTrack")] public bool StopTrack;
+        [FormerlySerializedAs("ready")] public bool Ready;
         public CoroutineHandle PlaybackCoroutine;
 
-        public float allowedSamples;
-        public int samplesPerSecond;
+        [FormerlySerializedAs("allowedSamples")]
+        public float AllowedSamples;
+
+        [FormerlySerializedAs("samplesPerSecond")]
+        public int SamplesPerSecond;
+
         public Queue<float> StreamBuffer { get; } = new Queue<float>();
         public VorbisReader VorbisReader { get; set; }
         public float[] SendBuffer { get; set; }
@@ -41,20 +49,33 @@ namespace SCPSLAudioApi.AudioCore
 
         #region AudioPlayer Settings
 
-        /// <summary>
-        /// The ReferenceHub instance that this player sends as.
-        /// </summary>
-        public ReferenceHub Owner { get; set; }
+        public SpeakerToy SpeakerToy { get; set; }
 
         /// <summary>
         /// Volume that the player will play at.
         /// </summary>
-        public float Volume { get; set; } = 100f;
+        public float Volume
+        {
+            get => SpeakerToy.NetworkVolume;
+            set => SpeakerToy.NetworkVolume = value;
+        }
+
+        public bool IsSpatial
+        {
+            get => SpeakerToy.NetworkIsSpatial;
+            set => SpeakerToy.NetworkIsSpatial = value;
+        }
+
+        public Vector3 Position
+        {
+            get => SpeakerToy.transform.position;
+            set => SpeakerToy.transform.position = value;
+        }
 
         /// <summary>
         /// List of Paths/Urls that the player will play from (Urls only work if <see cref="AllowUrl"/> is true)
         /// </summary>
-        public List<string> AudioToPlay = new List<string>();
+        public List<string> AudioToPlay = [];
 
         /// <summary>
         /// Path/Url of the currently playing audio file.
@@ -69,12 +90,12 @@ namespace SCPSLAudioApi.AudioCore
         /// <summary>
         /// Boolean indicating whether or not the Queue will loop (Audio will be added to the end of the queue after it gets removed on play)
         /// </summary>
-        public bool Loop = false;
+        public bool Loop;
 
         /// <summary>
         /// If the playlist should be shuffled when an audio track start.
         /// </summary>
-        public bool Shuffle = false;
+        public bool Shuffle;
 
         /// <summary>
         /// Whether the Player should continue playing by itself after the current Track ends.
@@ -89,37 +110,32 @@ namespace SCPSLAudioApi.AudioCore
         /// <summary>
         /// If URLs are allowed to be played
         /// </summary>
-        public bool AllowUrl = false;
+        public bool AllowUrl;
 
         /// <summary>
         /// Determines whether debug logs should be shown. Note: Enabling this option can generate a large amount of log output.
         /// </summary>
-        public bool LogDebug = false;
+        public bool LogDebug;
 
         /// <summary>
         /// Determines whether informational logs should be shown throughout the code.
         /// </summary>
-        public bool LogInfo = false;
+        public bool LogInfo;
 
         /// <summary>
         /// Gets a value indicating whether the current song has finished playing.
         /// </summary>
-        public bool IsFinished = false;
+        public bool IsFinished;
 
         /// <summary>
         /// Determines whether the ReferenceHub will be destroyed after finishing playing all tracks.
         /// </summary>
-        public bool ClearOnFinish = false;
+        public bool ClearOnFinish;
 
         /// <summary>
         /// If not empty, the audio will only be sent to players with the PlayerIds in this list
         /// </summary>
-        public List<int> BroadcastTo = new List<int>();
-
-        /// <summary>
-        /// Gets or Sets the Channel where audio will be played in
-        /// </summary>
-        public VoiceChatChannel BroadcastChannel { get; set; } = VoiceChatChannel.Proximity;
+        public List<int> BroadcastTo = [];
 
         #endregion
 
@@ -131,7 +147,8 @@ namespace SCPSLAudioApi.AudioCore
         /// <param name="playerBase">The AudioPlayer instance that this event fired for</param>
         /// <param name="directPlay">If the AudioPlayer was playing Directly (-1 index)</param>
         /// <param name="queuePos">Position in the Queue of the track that is going to be selected</param>
-        public delegate void TrackSelecting(AudioPlayerBase playerBase, bool directPlay, ref int queuePos);
+        public delegate void TrackSelecting(AudioSpeakerBase speakerBase, bool directPlay, ref int queuePos);
+
         public static event TrackSelecting OnTrackSelecting;
 
         /// <summary>
@@ -141,7 +158,9 @@ namespace SCPSLAudioApi.AudioCore
         /// <param name="directPlay">If the AudioPlayer was playing Directly (-1 index)</param>
         /// <param name="queuePos">Position in the Queue of the track that will start</param>
         /// <param name="track">The track the AudioPlayer will play</param>
-        public delegate void TrackSelected(AudioPlayerBase playerBase, bool directPlay, int queuePos, ref string track);
+        public delegate void TrackSelected(AudioSpeakerBase speakerBase, bool directPlay, int queuePos,
+            ref string track);
+
         public static event TrackSelected OnTrackSelected;
 
 
@@ -152,7 +171,8 @@ namespace SCPSLAudioApi.AudioCore
         /// <param name="directPlay">If the AudioPlayer was playing Directly (-1 index)</param>
         /// <param name="queuePos">Position in the Queue that will play</param>
         /// <param name="track">The track the AudioPlayer will play</param>
-        public delegate void TrackLoaded(AudioPlayerBase playerBase, bool directPlay, int queuePos, string track);
+        public delegate void TrackLoaded(AudioSpeakerBase speakerBase, bool directPlay, int queuePos, string track);
+
         public static event TrackLoaded OnTrackLoaded;
 
         /// <summary>
@@ -162,28 +182,53 @@ namespace SCPSLAudioApi.AudioCore
         /// <param name="track">The track the AudioPlayer was playing</param>
         /// <param name="directPlay">If the AudioPlayer was playing Directly (-1 index)</param>
         /// <param name="nextQueuePos">Position in the Queue that will play next, can be set to a different value</param>
-        public delegate void TrackFinished(AudioPlayerBase playerBase, string track, bool directPlay, ref int nextQueuePos);
+        public delegate void TrackFinished(AudioSpeakerBase speakerBase, string track, bool directPlay,
+            ref int nextQueuePos);
+
         public static event TrackFinished OnFinishedTrack;
 
         #endregion
 
-        /// <summary>
-        /// Add or retrieve the AudioPlayerBase instance based on a ReferenceHub instance.
-        /// </summary>
-        /// <param name="hub">The ReferenceHub instance that this AudioPlayer belongs to</param>
-        /// <returns><see cref="AudioPlayerBase"/></returns>
-        public static AudioPlayerBase Get(ReferenceHub hub)
+        public static AudioSpeakerBase Create()
         {
-            if (AudioPlayers.TryGetValue(hub, out AudioPlayerBase player))
+            AdminToyBase origin = null;
+            foreach (var value in NetworkClient.prefabs.Values)
             {
-                return player;
+                if (!value.TryGetComponent<AdminToyBase>(out var at) ||
+                    at.CommandName is not "Speaker") continue;
+                origin = at;
+                break;
             }
 
-            player = hub.gameObject.AddComponent<AudioPlayerBase>();
-            player.Owner = hub;
+            if (origin == null) throw new NullReferenceException($"未获取到玩具");
+            GameObject gameObject = Instantiate(origin.gameObject);
+            SpeakerToy toy = gameObject.GetComponent<SpeakerToy>();
+            toy.ControllerId = ++Id;
+            return Create(toy);
+        }
 
-            AudioPlayers.Add(hub, player);
-            return player;
+        public static AudioSpeakerBase Create(SpeakerToy toy)
+        {
+            AudioSpeakerBase audioPlayerBase2 = toy.gameObject.AddComponent<AudioSpeakerBase>();
+            NetworkServer.Spawn(audioPlayerBase2.gameObject);
+            toy.transform.localScale = Vector3.one;
+            toy.Playback.ControllerId = toy.ControllerId;
+            toy.Playback.Source.spatialBlend = toy.IsSpatial ? 1f : 0.0f;
+            toy.Playback.Source.volume = Mathf.Clamp(toy.Volume, 0.0f, 1f);
+            toy.Playback.Source.minDistance = toy.MinDistance;
+            toy.Playback.Source.maxDistance = toy.MaxDistance;
+            audioPlayerBase2.SpeakerToy = toy;
+            AudioSpeakerToys.Add(toy, audioPlayerBase2);
+            return audioPlayerBase2;
+        }
+
+        public static AudioSpeakerBase Get(SpeakerToy toy)
+        {
+            if (AudioSpeakerToys.TryGetValue(toy, out AudioSpeakerBase audioPlayerBase1))
+                return audioPlayerBase1;
+            AudioSpeakerBase audioPlayerBase2 = toy.gameObject.AddComponent<AudioSpeakerBase>();
+            AudioSpeakerToys.Add(toy, audioPlayerBase2);
+            return audioPlayerBase2;
         }
 
         /// <summary>
@@ -200,12 +245,12 @@ namespace SCPSLAudioApi.AudioCore
         /// <summary>
         /// Stops playing the current Track, or stops the player entirely if Clear is true.
         /// </summary>
-        /// <param name="Clear">If true the player will stop and the queue will be cleared.</param>
-        public virtual void Stoptrack(bool Clear)
+        /// <param name="clear">If true the player will stop and the queue will be cleared.</param>
+        public virtual void Stoptrack(bool clear)
         {
-            if (Clear)
+            if (clear)
                 AudioToPlay.Clear();
-            stopTrack = true;
+            StopTrack = true;
         }
 
         /// <summary>
@@ -226,15 +271,15 @@ namespace SCPSLAudioApi.AudioCore
             if (PlaybackCoroutine.IsRunning)
                 Timing.KillCoroutines(PlaybackCoroutine);
 
-            AudioPlayers.Remove(Owner);
+            AudioSpeakerToys.Remove(SpeakerToy);
 
             if (ClearOnFinish)
-                NetworkServer.RemovePlayerForConnection(Owner.connectionToClient, true);
+                NetworkServer.Destroy(SpeakerToy.gameObject);
         }
 
         public virtual IEnumerator<float> Playback(int position)
         {
-            stopTrack = false;
+            StopTrack = false;
             IsFinished = false;
             int index = position;
 
@@ -273,6 +318,7 @@ namespace SCPSLAudioApi.AudioCore
                         if (AudioToPlay.Count >= 1)
                             Timing.RunCoroutine(Playback(0));
                     }
+
                     yield break;
                 }
 
@@ -290,6 +336,7 @@ namespace SCPSLAudioApi.AudioCore
                             Timing.RunCoroutine(Playback(0));
                         yield break;
                     }
+
                     CurrentPlayStream = new MemoryStream(File.ReadAllBytes(CurrentPlay));
                 }
                 else
@@ -302,10 +349,21 @@ namespace SCPSLAudioApi.AudioCore
                 }
             }
 
-            CurrentPlayStream.Seek(0, SeekOrigin.Begin);
+            try
+            {
+                if (LogInfo)
+                    Log.Info($"新建中");
+                CurrentPlayStream.Seek(0, SeekOrigin.Begin);
 
-            VorbisReader = new NVorbis.VorbisReader(CurrentPlayStream);
+                VorbisReader = new VorbisReader(CurrentPlayStream);
+            }
+            catch (Exception e)
+            {
+                Log.Error(e.ToString());
+            }
 
+            if (LogInfo)
+                Log.Info($"开始检查声道");
             if (VorbisReader.Channels >= 2)
             {
                 Log.Error($"Audio file {CurrentPlay} is not valid. Audio files must be mono.");
@@ -317,6 +375,8 @@ namespace SCPSLAudioApi.AudioCore
                 yield break;
             }
 
+            if (LogInfo)
+                Log.Info("开始检查码率");
             if (VorbisReader.SampleRate != 48000)
             {
                 Log.Error($"Audio file {CurrentPlay} is not valid. Audio files must have a SamepleRate of 48000");
@@ -327,32 +387,38 @@ namespace SCPSLAudioApi.AudioCore
                 CurrentPlayStream.Dispose();
                 yield break;
             }
+
             OnTrackLoaded?.Invoke(this, index == -1, index, CurrentPlay);
 
             if (LogInfo)
                 Log.Info($"Playing {CurrentPlay} with samplerate of {VorbisReader.SampleRate}");
 
-            samplesPerSecond = VoiceChatSettings.SampleRate * VoiceChatSettings.Channels;
+            SamplesPerSecond = VoiceChatSettings.SampleRate * VoiceChatSettings.Channels;
             //_samplesPerSecond = VorbisReader.Channels * VorbisReader.SampleRate / 5;
-            SendBuffer = new float[samplesPerSecond / 5 + HeadSamples];
-            ReadBuffer = new float[samplesPerSecond / 5 + HeadSamples];
+            SendBuffer = new float[SamplesPerSecond / 5 + HEAD_SAMPLES];
+            ReadBuffer = new float[SamplesPerSecond / 5 + HEAD_SAMPLES];
             int cnt;
+            if (LogInfo)
+                Log.Info($"开始循环");
             while ((cnt = VorbisReader.ReadSamples(ReadBuffer, 0, ReadBuffer.Length)) > 0)
             {
-                if (stopTrack)
+                if (StopTrack)
                 {
                     VorbisReader.SeekTo(VorbisReader.TotalSamples - 1);
-                    stopTrack = false;
+                    StopTrack = false;
                 }
+
                 while (!ShouldPlay)
                 {
                     yield return Timing.WaitForOneFrame;
                 }
+
                 while (StreamBuffer.Count >= ReadBuffer.Length)
                 {
-                    ready = true;
+                    Ready = true;
                     yield return Timing.WaitForOneFrame;
                 }
+
                 for (int i = 0; i < ReadBuffer.Length; i++)
                 {
                     StreamBuffer.Enqueue(ReadBuffer[i]);
@@ -388,24 +454,29 @@ namespace SCPSLAudioApi.AudioCore
 
         public virtual void Update()
         {
-            if (Owner == null || !ready || StreamBuffer.Count == 0 || !ShouldPlay) return;
+            if (SpeakerToy is null || !Ready || StreamBuffer.Count == 0 || !ShouldPlay)
+            {
+                return;
+            }
 
-            allowedSamples += Time.deltaTime * samplesPerSecond;
-            int toCopy = Mathf.Min(Mathf.FloorToInt(allowedSamples), StreamBuffer.Count);
+            AllowedSamples += Time.deltaTime * SamplesPerSecond;
+            int toCopy = Mathf.Min(Mathf.FloorToInt(AllowedSamples), StreamBuffer.Count);
             if (LogDebug)
-                Log.Debug($"1 {toCopy} {allowedSamples} {samplesPerSecond} {StreamBuffer.Count} {PlaybackBuffer.Length} {PlaybackBuffer.WriteHead}");
+                Log.Debug(
+                    $"1 {toCopy} {AllowedSamples} {SamplesPerSecond} {StreamBuffer.Count} {PlaybackBuffer.Length} {PlaybackBuffer.WriteHead}");
             if (toCopy > 0)
             {
                 for (int i = 0; i < toCopy; i++)
                 {
-                    PlaybackBuffer.Write(StreamBuffer.Dequeue() * (Volume / 100f));
+                    PlaybackBuffer.Write(StreamBuffer.Dequeue());
                 }
             }
 
             if (LogDebug)
-                Log.Debug($"2 {toCopy} {allowedSamples} {samplesPerSecond} {StreamBuffer.Count} {PlaybackBuffer.Length} {PlaybackBuffer.WriteHead}");
+                Log.Debug(
+                    $"2 {toCopy} {AllowedSamples} {SamplesPerSecond} {StreamBuffer.Count} {PlaybackBuffer.Length} {PlaybackBuffer.WriteHead}");
 
-            allowedSamples -= toCopy;
+            AllowedSamples -= toCopy;
 
             while (PlaybackBuffer.Length >= 480)
             {
@@ -414,9 +485,10 @@ namespace SCPSLAudioApi.AudioCore
 
                 foreach (var plr in ReferenceHub.AllHubs)
                 {
-                    if (plr.connectionToClient == null || !PlayerIsConnected(plr) || (BroadcastTo.Count >= 1 && !BroadcastTo.Contains(plr.PlayerId))) continue;
-
-                    plr.connectionToClient.Send(new VoiceMessage(Owner, BroadcastChannel, EncodedBuffer, dataLen, false));
+                    if (plr.connectionToClient == null || !PlayerIsConnected(plr) ||
+                        (BroadcastTo.Count >= 1 && !BroadcastTo.Contains(plr.PlayerId))) continue;
+                    plr.connectionToClient.Send(
+                        new AudioMessage(SpeakerToy.ControllerId, EncodedBuffer, dataLen));
                 }
             }
         }
@@ -434,7 +506,5 @@ namespace SCPSLAudioApi.AudioCore
                    !string.IsNullOrEmpty(hub.authManager.UserId) &&
                    !hub.authManager.UserId.Contains("Dummy");
         }
-
-
     }
 }
